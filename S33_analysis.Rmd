@@ -1,0 +1,905 @@
+---
+title: "S33 analysis markdown"
+author: "Marcos Machado"
+date: "12/2021"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    df_print: paged
+    number_sections: TRUE
+  pdf_document: default
+---
+
+```{r setup, include=FALSE,echo=FALSE,message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy=TRUE, tidy.opts = list(width.cutoff = 60))
+```
+
+# ST data analysis pipeline (ST-BRCA project)
+
+## Loading packages 
+
+```{r, message=FALSE}
+library(ggplot2)
+library(Seurat)
+library(STutility)
+library(Matrix)
+library(Rcpp)
+library(harmony)
+library(patchwork)
+library(sctransform)
+library(png)
+library(dplyr)
+library(gprofiler2)
+library(scCATCH)
+library(tidyr)
+library(VennDiagram)
+#library(cellassign)
+#library(SingleCellExperiment)
+#library(tensorflow)
+#library(scater)
+```
+
+### Setting global variables
+
+This analysis pipeline works under the assumption that the sample files (Control and Tumor) are stored in each individual folder, one for the control sample, one for the tumor. It will create a list containing all the paths needed for downstream analysis using Stutility and Seurat. A global path needs to be provided (which contains the two sample folders), as well as the id's for the control and tumor samples.
+```{r}
+global.path <- "/mnt/storage/Documents/Academia/Daub_Lab/ST_BRCA_Project/Analysis/Data/patients_selected/S33"  # Replace with data path
+setwd(global.path) # this sets the file path as the working directory
+
+idControl <- "S33-C-2" # Name of the control sample
+idTumor <- "S33-T-2" # Name of the tumor sample
+```
+
+
+In this table we create a data.frame that will contain the to the paths we need as input for our analysis (samples, spot files, images, .json), so we can later make it iterable and run our analysis inside the R markdown file.
+
+```{r long_output}
+samplePaths <- list.files(global.path, full.names = T)
+infoTable <- data.frame()
+
+for (sample in 1:length(samplePaths)){
+  newDf <- data.frame("samples" = list.files(samplePaths[sample], full.names=T, pattern = ".h5"), 
+                    "spotfiles" = list.files(samplePaths[sample], full.names=T, pattern = ".csv"), 
+                    "imgs" = list.files(samplePaths[sample], full.names=T, pattern = ".png"), 
+                    "json" = list.files(samplePaths[sample], full.names=T, pattern = ".json"))
+infoTable <- rbind(infoTable, newDf)
+}
+```
+
+
+## Creating a Seurat Object from the table 
+
+```{r, message=FALSE}
+se <- InputFromTable(infotable = infoTable,
+                      platform =  "Visium"
+                     )
+
+se$sample_id <- paste0("sample_", GetStaffli(se)@meta.data$sample)
+se$orig.ident <- "S33"
+st.object <- GetStaffli(se)
+st.object
+```
+## Initial visualization
+
+For an initial view of the distribution of the features along the spots, we use the "**ST.FeaturePlot**" command.  
+
+### Feature plot
+```{r, fig.width= 14, fig.height= 7}
+ST.FeaturePlot(se, features = c("nFeature_RNA"), palette = "Spectral", ncol = 2, pt.size = 2.5)
+```
+
+### Count plot
+```{r, fig.width= 14, fig.height= 7}
+ST.FeaturePlot(se, features = c("nCount_RNA"), palette = "Spectral", ncol = 2, pt.size = 2.5)
+```
+
+## QC
+
+### QC plots
+
+### Generate a subset for the control and tumor
+```{r}
+# se_subsetControl <- InputFromTable(infoTable[1,])
+se_subsetControl <- SubsetSTData(se, expression = sample_id %in% "sample_1")
+se_subsetControl <- SetIdent(se_subsetControl, value = idControl)
+se_subsetControl$sample_id <- idControl
+se_subsetControl
+
+# se_subsetTumor <- InputFromTable(infoTable[2,])
+se_subsetTumor <- SubsetSTData(se, expression = sample_id %in% "sample_2")
+se_subsetTumor <- SetIdent(se_subsetTumor, value = idTumor)
+se_subsetTumor$sample_id <- idTumor
+se_subsetTumor
+```
+
+### Generate QC plotting function
+
+This is unused by now. this generates feature and count distribution in the form of histograms. 
+```{r}
+generateQCplots <- function(sampleSubset, title, color){
+
+    p1 <- ggplot() +
+      geom_histogram(data = sampleSubset[[]], aes(nFeature_RNA), fill = color, alpha = 0.7, bins = 100) +
+      ggtitle("Unique genes per spot")
+    
+    p2 <- ggplot() +
+      geom_histogram(data = sampleSubset[[]], aes(nCount_RNA), fill = color, alpha = 0.7, bins = 100) +
+      ggtitle("Total counts per spots")
+    
+    gene_attr <- data.frame(nUMI = Matrix::rowSums(sampleSubset@assays$RNA@counts), 
+                            nSpots = Matrix::rowSums(sampleSubset@assays$RNA@counts > 0))
+    p3 <- ggplot() +
+      geom_histogram(data = gene_attr, aes(nUMI), fill = color, alpha = 0.7, bins = 100) +
+      scale_x_log10() +
+      ggtitle("Total counts per gene (log10 scale)")
+    
+    p4 <- ggplot() +
+      geom_histogram(data = gene_attr, aes(nSpots), fill = color, alpha = 0.7,  bins = 100) +
+      ggtitle("Total spots per gene")
+    
+    (p1 - p2)/(p3 - p4) + plot_annotation(title = title)
+    
+}
+```
+
+### QC plots 
+
+#### Violin QC plots
+```{r}
+# mitochondrial genes
+mt.genesControl <- grep(pattern = "^MT-", x = rownames(se_subsetControl), value = TRUE)
+se_subsetControl$percent.mito <- (Matrix::colSums(se_subsetControl@assays$RNA@counts[mt.genesControl, ])/Matrix::colSums(se_subsetControl@assays$RNA@counts))*100
+#VlnPlot(se_subsetControl, features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), pt.size = 0.1, ncol = 3) + plot_annotation(paste("QC violin plot Control: ", idControl))
+
+mt.genesTumor <- grep(pattern = "^MT-", x = rownames(se_subsetTumor), value = TRUE)
+se_subsetTumor$percent.mito <- (Matrix::colSums(se_subsetTumor@assays$RNA@counts[mt.genesTumor, ])/Matrix::colSums(se_subsetTumor@assays$RNA@counts))*100
+#VlnPlot(se_subsetTumor, features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), pt.size = 0.1, ncol = 3, cols = "cornflowerblue") + plot_annotation(paste("QC violin plot Tumor: ", idTumor))
+
+# ribosomal genes
+rb.genesControl <- grep(pattern = "^RP[SL]", x = rownames(se_subsetControl), value = TRUE)
+se_subsetControl$percent.ribo <- (Matrix::colSums(se_subsetControl@assays$RNA@counts[rb.genesControl, ])/Matrix::colSums(se_subsetControl@assays$RNA@counts))*100
+VlnPlot(se_subsetControl, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.ribo"), pt.size = 0.1, ncol = 4) + plot_annotation(paste("QC violin plot Control: ", idControl))
+
+rb.genesTumor <- grep(pattern = "^RP[SL]", x = rownames(se_subsetTumor), value = TRUE)
+se_subsetTumor$percent.ribo <- (Matrix::colSums(se_subsetTumor@assays$RNA@counts[rb.genesTumor, ])/Matrix::colSums(se_subsetTumor@assays$RNA@counts))*100
+VlnPlot(se_subsetTumor, features = c("nCount_RNA", "nFeature_RNA", "percent.mito","percent.ribo"), pt.size = 0.1, ncol = 4, cols = "cornflowerblue") + plot_annotation(paste("QC violin plot Tumor: ", idTumor))
+```
+
+#### Merged violin QC plots
+```{r}
+merged <- MergeSTData(se_subsetControl, se_subsetTumor)
+VlnPlot(merged, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.ribo"), pt.size = 0.1, ncol = 4, group.by = "sample_id", cols = c("brown3", "cornflowerblue")) + plot_annotation("QC violin plot")
+```
+
+#### Count vs Feature correlation 
+
+These plots will help us with the thresholding:
+
+```{r}
+FeatureScatter(se_subsetControl, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "brown3") + plot_annotation(paste("Count vs Gene Scatter Plot ", idControl))
+FeatureScatter(se_subsetTumor, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "cornflowerblue") + plot_annotation(paste("Count vs Gene Scatter Plot ", idTumor))
+```
+#### Count vs Mitochondrial content
+
+```{r, fig.height=5, fig.width=10}
+p1 <- FeatureScatter(se_subsetControl, feature1 = "nCount_RNA", feature2 = "percent.mito", cols = "brown3") + plot_annotation(paste("Count vs % Mitochondrial Scatter Plot ", idControl))
+p2 <- FeatureScatter(se_subsetTumor, feature1 = "nCount_RNA", feature2 = "percent.mito", cols = "cornflowerblue") + plot_annotation(paste("Count vs % Mitochondrial Scatter Plot ", idTumor))
+
+p1 - p2
+```
+
+#### Count vs Ribosomal content
+
+```{r, fig.height=5, fig.width=10}
+FeatureScatter(se_subsetControl, feature1 = "nCount_RNA", feature2 = "percent.ribo", cols = "brown3") + plot_annotation(paste("Count vs % Ribosomal Scatter Plot ", idControl)) - FeatureScatter(se_subsetTumor, feature1 = "nCount_RNA", feature2 = "percent.ribo", cols = "cornflowerblue") + plot_annotation(paste("Count vs % Ribosomal Scatter Plot ", idTumor))
+```
+
+### QC filtering
+
+This will generate a **se** subset, a Seurat class object subset that will take the infoTable as input for the corresponding sample and apply filtering based on the following parameters:  
+ - Keeping only the genes that have presence in at least **5** capture spots and a total count value of >= **100**
+ - Keeping the only that spots that contain >= **200** transcripts
+ 
+#### Filtering spots and genes
+Here we are filtering based on a minimum UMI count per spot, minimum gene per spot, and also filtering genes that are not seen in more than **N** spots.   
+
+```{r}
+# Control
+se_subsetControlQC <- SubsetSTData(se_subsetControl, expression = nCount_RNA > 200)
+se_subsetControlQC <- SubsetSTData(se_subsetControlQC, expression = nFeature_RNA > 100)
+cat("Spots removed: ", ncol(se_subsetControl) - ncol(se_subsetControlQC), "\n")
+
+# Tumor
+se_subsetTumorQC <- SubsetSTData(se_subsetTumor, expression = nCount_RNA > 200)
+se_subsetTumorQC <- SubsetSTData(se_subsetTumorQC, expression = nFeature_RNA > 100)
+cat("Spots removed: ", ncol(se_subsetTumor) - ncol(se_subsetTumorQC), "\n")
+```
+#### Mitochondrial and Ribosomal filtering
+```{r}
+# Control
+se_subsetControlQCmito <- SubsetSTData(se_subsetControlQC, expression = percent.mito < 15)
+se_subsetControlQCribomito <- SubsetSTData(se_subsetControlQCmito, expression = percent.ribo < 25)
+cat("Spots removed: ", ncol(se_subsetControlQC) - ncol(se_subsetControlQCribomito), "\n")
+se_subsetControlQC <- se_subsetControlQCribomito
+# Tumor
+se_subsetTumorQCmito <- SubsetSTData(se_subsetTumorQC, expression = percent.mito < 15)
+se_subsetTumorQCribomito <- SubsetSTData(se_subsetTumorQCmito, expression = percent.ribo < 25)
+cat("Spots removed: ", ncol(se_subsetTumorQC) - ncol(se_subsetTumorQCribomito), "\n")
+se_subsetTumorQC <- se_subsetTumorQCribomito
+```
+
+#### Filter genes
+```{r}
+# Genes distributed in less than N spots
+expMatControl <- GetAssayData(se_subsetControlQC, slot = "counts")
+expMatTumor <- GetAssayData(se_subsetTumorQC, slot = "counts")
+gene.countsControl <- Matrix::rowSums(expMatControl)
+gene.countsTumor <- Matrix::rowSums(expMatTumor)
+valid.genesControl <- gene.countsControl > 2
+valid.genesTumor <- gene.countsTumor > 2
+keep.genesControl <- rownames(se_subsetControlQC)[valid.genesControl]
+keep.genesTumor <- rownames(se_subsetTumorQC)[valid.genesTumor]
+se_subsetControlQC <- SubsetSTData(se_subsetControlQC, features = keep.genesControl)
+se_subsetTumorQC <- SubsetSTData(se_subsetTumorQC, features = keep.genesTumor)
+length(keep.genesControl)
+length(keep.genesTumor)
+
+# Filter MALAT1
+
+keep.genesControl <- keep.genesControl[!(grepl("MALAT1", keep.genesControl))]
+keep.genesTumor <- keep.genesTumor[!(grepl("MALAT1", keep.genesTumor))]
+se_subsetControlQC <- SubsetSTData(se_subsetControlQC, features = keep.genesControl)
+se_subsetTumorQC <- SubsetSTData(se_subsetTumorQC, features = keep.genesTumor)
+length(keep.genesControl)
+length(keep.genesTumor)
+
+# Filter RPL13
+
+keep.genesControl <- keep.genesControl[!(grepl("RPL13", keep.genesControl))]
+keep.genesTumor <- keep.genesTumor[!(grepl("RPL13", keep.genesTumor))]
+se_subsetControlQC <- SubsetSTData(se_subsetControlQC, features = keep.genesControl)
+se_subsetTumorQC <- SubsetSTData(se_subsetTumorQC, features = keep.genesTumor)
+length(keep.genesControl)
+length(keep.genesTumor)
+
+# Update with valid genes
+se_subsetControlQC <- SubsetSTData(se_subsetControlQC, features = keep.genesControl)
+se_subsetTumorQC <- SubsetSTData(se_subsetTumorQC, features = keep.genesTumor)
+```
+
+
+### QC plots after filtering
+
+#### Violin QC plots (filtered)
+```{r}
+# Control
+VlnPlot(se_subsetControlQC, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.ribo"), pt.size = 0.1, ncol = 4) + plot_annotation(paste("QC violin plot Control:", idControl, "(filtered)"))
+
+# Tumor
+VlnPlot(se_subsetTumorQC, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.ribo"), pt.size = 0.1, ncol = 4, cols = "cornflowerblue") + plot_annotation(paste("QC violin plot Tumor:", idTumor, "(filtered)"))
+```
+
+#### Merged violin QC plots (filtered)
+```{r}
+mergedQC <- MergeSTData(se_subsetControlQC, se_subsetTumorQC)
+VlnPlot(mergedQC, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.ribo"), pt.size = 0.1, ncol = 4, group.by = "sample_id", cols = c("brown3", "cornflowerblue")) + plot_annotation("QC violin plot (filtered)")
+```
+
+
+### Count plots after filtering
+```{r, fig.width= 8, fig.height= 7}
+ST.FeaturePlot(se_subsetControlQC, features = c("nCount_RNA"), palette = "Spectral", ncol = 1, pt.size = 2.5) + plot_annotation(paste("Count spatial plot: ", idControl, "(filtered)"))
+ST.FeaturePlot(se_subsetTumorQC, features = c("nCount_RNA"), palette = "Spectral", ncol = 1, pt.size = 2.5) + plot_annotation(paste("Count spatial plot: ", idTumor, "(filtered)"))
+```
+
+### Object name change
+For simplicity, we are raplacing the name of our QC'd seurat object subsets to something more simple:  
+```{r}
+seControl <- se_subsetControlQC
+seTumor <- se_subsetTumorQC
+```
+
+## Overlaying feature plot with H&E image  
+```{r, fig.width= 8, fig.height= 7}
+# Control
+widthControl <- dim(readPNG(infoTable$imgs[1]))[2]
+seControl <- LoadImages(seControl, time.resolve = TRUE, verbose = TRUE, xdim = widthControl)
+controlPlot <- FeatureOverlay(seControl, 
+               features = "nCount_RNA", 
+               pt.size = 2.5,
+               palette = "Spectral", 
+               type = "raw",
+               pt.alpha = 0.6)
+
+se_subsetControl <- LoadImages(se_subsetControl, time.resolve = TRUE, verbose = TRUE, xdim = widthControl)
+controlPlotUnfiltered <- FeatureOverlay(se_subsetControl, 
+               features = "nCount_RNA", 
+               pt.size = 2.5,
+               palette = "Spectral", 
+               type = "raw",
+               pt.alpha = 0.6)
+
+# Tumor
+widthTumor <- dim(readPNG(infoTable[2,]$imgs))[1]
+seTumor <- LoadImages(seTumor, time.resolve = TRUE, verbose = TRUE, xdim = widthTumor)
+tumorPlot <- FeatureOverlay(seTumor, 
+               features = "nCount_RNA", 
+               pt.size = 2.5,
+               palette = "Spectral", 
+               type = "raw",
+               pt.alpha = 0.6)
+
+se_subsetTumor <- LoadImages(se_subsetTumor, time.resolve = TRUE, verbose = TRUE, xdim = widthTumor)
+tumorPlotUnfiltered <- FeatureOverlay(se_subsetTumor, 
+               features = "nCount_RNA", 
+               pt.size = 2.5,
+               palette = "Spectral", 
+               pt.alpha = 0.6,
+               type = "raw"
+               )
+
+(controlPlotUnfiltered + ggtitle("Overlay plot S33-C-2 (unfiltered)"))
+(controlPlot + ggtitle("Overlay plot S33-C-2 (filtered)"))
+(tumorPlotUnfiltered + ggtitle("Overlay plot S33-T-2 (unfiltered)"))
+(tumorPlot + ggtitle("Overlay plot S33-T-2 (filtered)"))
+```
+
+## Normalization
+
+Data normalization is made using the SCTransform function included in Seurat. The one being used is Variance Stabilized Transformation (Hafemeister & Satija, 2019). 
+
+### SCTransform
+```{r, warning=FALSE, message=FALSE, error=FALSE, eval=TRUE, results='hide'}
+# Control
+seControl <- SCTransform(seControl, return.only.var.genes = FALSE)
+seControl
+sprintf("the default assay in use is: %s", DefaultAssay(seControl))
+
+# Tumor
+seTumor <- SCTransform(seTumor, return.only.var.genes = FALSE)
+seTumor
+sprintf("the default assay in use is: %s", DefaultAssay(seTumor))
+```
+
+## Top expressed genes
+#### Function to get the top 20 genes
+We can later use this function in the clusters to extract the top genes in each cluster
+```{r, fig.width=7, fig.height=7}
+get_top20Genes <- function(object, title){
+  C = object@assays$SCT@counts      # WE ARE USING THE NORMALIZED COUNTS
+C@x = C@x/rep.int(colSums(C), diff(C@p))
+most_expressed <- order(Matrix::rowSums(C), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell", 
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+title(title)
+}
+pC <- get_top20Genes(seControl, paste("Top 20 expressed genes: ", idControl))
+pC
+pT <- get_top20Genes(seTumor, paste("Top 20 expressed genes: ", idTumor))
+pT
+```
+
+
+
+## Control and Tumor sample Integration with Harmony
+### Dimensionality reduction by PCA and Harmony batch correction
+```{r, warning=FALSE, results='hide'}
+# Merge both se objects
+mergedPCA <- MergeSTData(seControl, seTumor)
+mergedPCA <- SCTransform(mergedPCA, return.only.var.genes = FALSE)
+mergedPCA <- RunPCA(mergedPCA, assay = "SCT")
+head(Loadings(mergedPCA, reduction = "pca")[, 1:5])
+```
+
+#### PCA plot of uncorrected Principal Components
+```{r, fig.width=14, fig.height=7}
+plotPCA <- DimPlot(mergedPCA, reduction = "pca", group.by = "sample_id", cols = c("brown3", "cornflowerblue")) + ggtitle("PCA plot (Control vs Tumor)")
+plotVln <- VlnPlot(mergedPCA, features = "PC_1", group.by = "sample_id", cols = c("brown3", "cornflowerblue"))
+
+plotPCA - plotVln
+```
+
+#### Elbow plots 
+
+```{r}
+ElbowPlot(mergedPCA) + ggtitle("Elbow Plot")
+```
+
+#### Run Harmony
+```{r}
+mergedPCA <- RunHarmony(mergedPCA, group.by.vars = "sample_id", assay.use = "SCT", reduction = "pca", plot_convergence = TRUE)
+```
+
+#### PCA plots after correction
+```{r, fig.width=14, fig.height=7}
+plotPCA <- DimPlot(mergedPCA, reduction = "harmony", group.by = "sample_id", cols = c("brown3", "cornflowerblue")) + ggtitle("PCA plot (Control vs Tumor)")
+plotVln <- VlnPlot(mergedPCA, features = "harmony_1", group.by = "sample_id", cols = c("brown3", "cornflowerblue"))
+
+plotPCA - plotVln
+```
+
+## Expression of marker genes
+
+### PAM50 genes
+```{r, fig.width=14, fig.height=7}
+pam50 <- c('UBE2T', 'BIRC5', 'NUF2', 'CDC6', 'CCNB1', 'TYMS', 'MYBL2', 'CEP55', 'MELK', 'NDC80', 'RRM2', 'UBE2C', 'CENPF', 'PTTG1', 'EXO1', 'ORC6L', 'ANLN', 'CCNE1', 'CDC20', 'MKI67', 'KIF2C', 'ACTR3B', 'MYC', 'EGFR', 'KRT5', 'PHGDH', 'CDH3', 'MIA', 'KRT17', 'FOXC1', 'SFRP1', 'KRT14', 'ESR1', 'SLC39A6', 'BAG1', 'MAPT', 'PGR', 'CXXC5', 'MLPH', 'BCL2', 'MDM2', 'NAT1', 'FOXA1', 'BLVRA', 'MMP11', 'GPR160', 'FGFR4', 'GRB7', 'TMEM45B','ERBB2')
+
+for (gene in pam50){
+  
+  plot <- tryCatch(ST.FeaturePlot(mergedPCA, features = gene, pt.size = 2.5, palette = "Spectral", ncol = 2), error=function(e) NA)
+  print(plot)
+}
+```
+
+### Markers from Yoosuf et al. 
+(https://doi.org/10.1186/s13058-019-1242-9)
+```{r, fig.width=14, fig.height=7}
+# NORAD (LINC00657); COL1A2; SCD
+ST.FeaturePlot(mergedPCA, features = c("NORAD"), pt.size = 2.5, palette = "Spectral", ncol=2)
+ST.FeaturePlot(mergedPCA, features = c("COL1A2"), pt.size = 2.5, palette = "Spectral", ncol=2)
+ST.FeaturePlot(mergedPCA, features = c("SCD"), pt.size = 2.5, palette = "Spectral", ncol=2)
+```
+
+### Cancer sample vs non-cancer expression of markers
+
+#### PAM50
+```{r, fig.height=25, fig.width=50}
+VlnPlot(mergedPCA, features = pam50, same.y.lims = TRUE, group.by = "sample_id", ncol = 10)
+```
+
+### Markers from Yoosuf et al. 
+```{r}
+VlnPlot(mergedPCA, features = c("NORAD", "COL1A2", "SCD"), same.y.lims = TRUE, group.by = "sample_id", ncol = 3)
+```
+
+
+## Clustering the integrated dataset
+
+```{r}
+mergedPCA <- FindNeighbors(mergedPCA, reduction = "harmony", dims = 1:8) ## BASED ON ELBOW PLOT
+mergedPCA <- FindClusters(mergedPCA, verbose = FALSE, resolution = 0.2) ## CLUSTER FORMATION RESOLUTION
+mergedPCA <- RunUMAP(mergedPCA, reduction = "harmony", dims = 1:8) ## BASED ON ELBOW PLOT
+```
+
+#### UMAP merged plot by sample ID
+```{r, fig.width=7, fig.height=5}
+plt.UMAP.merged <- DimPlot(mergedPCA, reduction = "umap", group.by = "sample_id") + ggtitle(paste("UMAP plot Merged(", idControl, "and", idTumor, ")"))
+plt.UMAP.merged
+```
+
+#### UMAP plot by cluster
+```{r, fig.width=10, fig.height=5}
+plt.UMAP.merged <- DimPlot(mergedPCA, reduction = "umap", split.by = "sample_id") + ggtitle(paste("UMAP plot Merged(", idControl, "and", idTumor, ")"))
+plt.UMAP.merged
+```
+
+
+#### Spatial UMAP merged
+```{r, fig.width=14, fig.height=7}
+plt.spatialUMAP.merged <- ST.FeaturePlot(mergedPCA, features = "seurat_clusters", pt.size = 2.6, palette = "Spectral", ncol = 2) + ggtitle(paste("Spatial UMAP plot Merged(", idControl, "and", idTumor, ")"))
+plt.spatialUMAP.merged
+```
+
+#### Spatial UMAP by cluster
+
+##### Subsetting corrected data
+```{r}
+# Control
+seControl <- SubsetSTData(mergedPCA, expression = sample_id %in% idControl)
+
+# Tumor
+seTumor <- SubsetSTData(mergedPCA, expression = sample_id %in% idTumor)
+```
+
+#### Split UMAP plot
+```{r, fig.width=21, fig.height=14}
+# Control
+ST.FeaturePlot(seControl, features = "seurat_clusters", pt.size = 2.6, split.labels = T, ncol = 3) + ggtitle(paste("Spatial UMAP plot ", idControl))
+
+# Tumor
+ST.FeaturePlot(seTumor, features = "seurat_clusters", pt.size = 2.6, split.labels = T, ncol = 3) + ggtitle(paste("Spatial UMAP plot ", idTumor))
+```
+
+#### Overlaying UMAP clusters with tissue 
+
+```{r, fig.width=8, fig.height=7}
+# Control
+widthControl <- dim(readPNG(infoTable$imgs[1]))[2]
+seControl <- LoadImages(seControl, time.resolve = TRUE, verbose = TRUE, xdim = widthControl)
+FeatureOverlay(seControl, 
+               features = "seurat_clusters", 
+               pt.size = 2.5,
+               palette = "Spectral",
+               pt.alpha = 0.4,
+               sample.label = FALSE
+) + ggtitle(paste("Spatial overlay UMAP plot ", idControl))
+
+# Tumor
+widthTumor <- dim(readPNG(infoTable[2,]$imgs))[1]
+seTumor <- LoadImages(seTumor, time.resolve = TRUE, verbose = TRUE, xdim = widthTumor)
+FeatureOverlay(seTumor, 
+               features = "seurat_clusters", 
+               pt.size = 2.5,
+               palette = "Spectral",
+               pt.alpha = 0.4,
+               sample.label = FALSE
+) + ggtitle(paste("Spatial overlay UMAP plot ", idTumor))
+```
+
+
+## Differential expression analysis (DEA)
+
+### Find All markers 
+#### (Pairwise between its cluster and its background (rest of the tissue))
+
+Using FindMarkers function (Seurat). Default test = **Wilcoxon Rank Sum** test. Using a p-value threshold of **0.01**
+
+```{r, fig.height=14, fig.width=7}
+markersAll <- FindAllMarkers(mergedPCA, assay = "SCT", return.thresh = 0.01)
+markersAll %>% group_by(cluster) %>% top_n(n = 4, wt = avg_log2FC)
+```
+
+### Heatmap 
+
+Here we are going to plot a heatmap of the **20** top expressed genes per cluster
+
+```{r, fig.height=14, fig.width=7}
+top20 <- markersAll %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+DoHeatmap(mergedPCA, features = top20$gene, group.bar.height = 0.005, slot = "scale.data") + plot_annotation("Heatmap of differentially expressed genes between clusters")
+```
+
+## Cluster visualizations
+
+#### Function to generate plots for most DE genes per cluster
+
+```{r}
+generateplotsDE <- function(cluster, ngenes, plot){
+cluster.markers <- FindMarkers(mergedPCA, ident.1 = cluster, thresh.use = 0.01, only.pos = T) # here we extract markers for cluster N but only the up-regulated ones
+# Most DE on cluster N 
+cluster.top <- rownames(cluster.markers)[1:ngenes]
+# plot choice (because rmarkdown doesnt let us plot everything with 1 single function run)
+if (plot == "violin"){
+  VlnPlot(mergedPCA, features = c(cluster.top), same.y.lims = TRUE, ncol = 5) + theme(legend.position = 'right')
+} else if(plot=="umap"){FeaturePlot(mergedPCA, features = cluster.top, ncol = 5)
+} else if(plot=="spatial"){ST.FeaturePlot(mergedPCA, features = cluster.top, palette = "Spectral", pt.size = 2.5)}
+}
+```
+
+### Cluster 0
+#### Top 5 genes
+##### Violin plot
+```{r, fig.height=7, fig.width=14}
+generateplotsDE(0, 10, "violin")
+```
+
+##### UMAP plot
+```{r, fig.height=5, fig.width=15}
+generateplotsDE(0, 10, "umap")
+```
+
+##### Spatial plot
+```{r, fig.height=14, fig.width=35}
+generateplotsDE(0, 5, "spatial")
+```
+
+### Cluster 1
+#### Top 5 genes
+##### Violin plot
+```{r, fig.height=7, fig.width=14}
+generateplotsDE(1, 10, "violin")
+```
+
+##### UMAP plot
+```{r, fig.height=5, fig.width=15}
+generateplotsDE(1, 10, "umap")
+```
+
+##### Spatial plot
+```{r, fig.height=14, fig.width=35}
+generateplotsDE(1, 5, "spatial")
+```
+
+### Cluster 2
+#### Top 5 genes
+##### Violin plot
+```{r, fig.height=7, fig.width=14}
+generateplotsDE(2, 10, "violin")
+```
+
+##### UMAP plot
+```{r, fig.height=5, fig.width=15}
+generateplotsDE(2, 10, "umap")
+```
+
+##### Spatial plot
+```{r, fig.height=14, fig.width=35}
+generateplotsDE(2, 5, "spatial")
+```
+
+### Cluster 3
+#### Top 5 genes
+##### Violin plot
+```{r, fig.height=7, fig.width=14}
+generateplotsDE(3, 10, "violin")
+```
+
+##### UMAP plot
+```{r, fig.height=5, fig.width=15}
+generateplotsDE(3, 10, "umap")
+```
+
+##### Spatial plot
+```{r, fig.height=14, fig.width=35}
+generateplotsDE(3, 5, "spatial")
+```
+
+
+### Cluster 4
+#### Top 5 genes
+##### Violin plot
+```{r, fig.height=7, fig.width=14}
+generateplotsDE(4, 10, "violin")
+```
+
+##### UMAP plot
+```{r, fig.height=5, fig.width=15}
+generateplotsDE(4, 10, "umap")
+```
+
+##### Spatial plot
+```{r, fig.height=14, fig.width=35}
+generateplotsDE(4, 5, "spatial")
+```
+
+
+## Cluster annotation
+
+### Functional Enrichment Analysis (FEA)
+
+#### Marker subset for each cluster
+```{r}
+# Create marker subset for each cluster
+markers0 <- subset(markersAll, cluster == "0") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+markers1 <- subset(markersAll, cluster == "1") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+markers2 <- subset(markersAll, cluster == "2") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+markers3 <- subset(markersAll, cluster == "3") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+markers4 <- subset(markersAll, cluster == "4") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+# markers5 <- subset(markersAll, cluster == "5") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+# markers6 <- subset(markersAll, cluster == "6") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+# markers7 <- subset(markersAll, cluster == "7") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+# markers8 <- subset(markersAll, cluster == "8") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+#markers9 <- subset(markersAll, cluster == "9") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+#markers10 <- subset(markersAll, cluster == "10") %>% filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene)
+```
+
+#### Run FEA
+
+Here we run FEA using gprofiler2, and the source we use is Gene Ontology: Biological Process (GO:BP)  
+```{r}
+go0 <- gost(query = markers0, organism = "hsapiens", significant = TRUE, sources = c("GO:MF", "GO:BP", "KEGG", "REAC", "HP", "HPA", "WP"))
+go1 <- gost(query = markers1, organism = "hsapiens", significant = TRUE, sources = c("GO:MF", "GO:BP", "KEGG", "REAC", "HP", "HPA", "WP"))
+go2 <- gost(query = markers2, organism = "hsapiens", significant = TRUE, sources = c("GO:MF", "GO:BP", "KEGG", "REAC", "HP", "HPA", "WP"))
+go3 <- gost(query = markers3, organism = "hsapiens", significant = TRUE, sources = c("GO:MF", "GO:BP", "KEGG", "REAC", "HP", "HPA", "WP"))
+go4 <- gost(query = markers4, organism = "hsapiens", significant = TRUE, sources = c("GO:MF", "GO:BP", "KEGG", "REAC", "HP", "HPA", "WP"))
+# go5 <- gost(query = markers5, organism = "hsapiens", significant = TRUE, sources = c("GO", "KEGG", "REAC", "TF", "MIRNA", "CORUM", "HP", "HPA", "WP"))
+# go6 <- gost(query = markers6, organism = "hsapiens", significant = TRUE, sources = c("GO", "KEGG", "REAC", "TF", "MIRNA", "CORUM", "HP", "HPA", "WP"))
+# go7 <- gost(query = markers7, organism = "hsapiens", significant = TRUE, sources = "GO:BP")
+# go8 <- gost(query = markers8, organism = "hsapiens", significant = TRUE, sources = "GO:BP")
+# go9 <- gost(query = markers9, organism = "hsapiens", significant = TRUE, sources = "GO:BP")
+# go10 <- gost(query = markers10, organism = "hsapiens", significant = TRUE, sources = "GO:BP")
+```
+
+
+##### View results
+```{r}
+go0$result
+go1$result
+go2$result
+go3$result
+go4$result
+# go5$result
+# go6$result
+# go7$result
+# go8$result
+#go9$result
+#go10$result
+```
+
+### Marker gene expression in clusters 
+
+#### PAM50
+```{r, fig.height=25, fig.width=50}
+VlnPlot(mergedPCA, features = pam50, same.y.lims = TRUE, ncol = 10)
+```
+
+#### Yoosuf et al.  
+
+```{r}
+VlnPlot(mergedPCA, features = c("NORAD", "COL1A2", "SCD"), same.y.lims = TRUE, ncol = 3)
+```
+
+## Healthy cluster heterogeneity
+
+### Subclustering of healthy regions
+Subclustering healthy areas that span both samples to see how differently they cluster. 
+```{r}
+# dimensional reduction and batch correction
+healthy <- SubsetSTData(mergedPCA, idents = c(0))
+healthy <- RunPCA(healthy, assay = "SCT")
+ElbowPlot(healthy) + ggtitle("Elbow Plot")
+healthy <- RunHarmony(healthy, group.by.vars = "sample_id", assay.use = "SCT", reduction = "pca", plot_convergence = TRUE)
+
+# clustering
+healthy <- FindNeighbors(healthy, reduction = "harmony", dims = 1:6) ## BASED ON ELBOW PLOT
+healthy <- FindClusters(healthy, verbose = FALSE, resolution = 0.2) ## CLUSTER FORMATION RESOLUTION
+healthy <- RunUMAP(healthy, reduction = "harmony", dims = 1:6) ## BASED ON ELBOW PLOT
+
+DimPlot(healthy, reduction = "umap") + ggtitle("Subclustering of healthy clusters")
+```
+
+#### Mapping to tissue
+```{r, fig.width=14, fig.height=7}
+ST.FeaturePlot(healthy, features = "seurat_clusters", pt.size = 2.6, ncol = 2) + ggtitle("Mapping of healthy subclusters")
+```
+
+#### Cluster distribution across samples
+```{r}
+meta.data <- healthy[[]]
+counts <- group_by(meta.data, sample_id, seurat_clusters) %>% summarise(count = n())
+ggplot(counts, aes(sample_id, count, fill = seurat_clusters)) +
+  geom_col(position = "fill") + scale_y_continuous(labels = scales::percent) + ggtitle("Cluster distribution across samples")
+```
+
+### Marker gene expression in healthy areas between samples
+
+#### Markers and heatmap
+```{r, fig.height=14, fig.width=7}
+healthy <- SetIdent(healthy, value = "sample_id")
+markersAll_healthy <- FindAllMarkers(healthy, assay = "SCT", return.thresh = 0.01)
+markersAll_healthy %>% group_by(cluster) %>% top_n(n = 4, wt = avg_log2FC)
+top20_healthy <- markersAll_healthy %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+DoHeatmap(healthy, features = top20_healthy$gene, group.bar.height = 0.005, slot = "scale.data", group.by = "sample_id") + plot_annotation("Heatmap of differentially expressed genes across healthy regions")
+```
+
+#### Plotting selected cancer marker genes
+Cancer marker genes that are overexpressed in the healthy tissue area compared to the control sample. 
+```{r, fig.height=10, fig.width=15}
+top.healthy <- top20_healthy$gene[21:30]
+VlnPlot(healthy, features = top.healthy, group.by = "sample_id", assay = "SCT", ncol = 5, same.y.lims = TRUE) + plot_annotation("Differentially expressed cancer genes in healthy areas aross samples")
+#VlnPlot(healthy, features = c("PKM", "CD24", "FN1", "CBX3"), group.by = "sample_id") + plot_annotation("Differentially expressed cancer genes in healthy areas aross samples")
+```
+
+
+
+## Clustering without control sample
+
+```{r}
+seTumor <- RunPCA(seTumor, verbose = FALSE, assay = "SCT")
+ElbowPlot(seTumor) + ggtitle("Elbow plot")
+seTumor <- FindNeighbors(seTumor, reduction = "pca", dims = 1:7) ## BASED ON ELBOW PLOT
+seTumor <- FindClusters(seTumor, verbose = FALSE, resolution = 0.5) ## CLUSTER FORMATION RESOLUTION
+seTumor <- RunUMAP(seTumor, reduction = "pca", dims = 1:7) ## BASED ON ELBOW PLOT
+
+DimPlot(seTumor, reduction = "umap") + ggtitle("UMAP plot (Control-independent)")
+```
+```{r, fig.height=8, fig.width=8}
+ST.FeaturePlot(seTumor, features = "seurat_clusters", pt.size = 2.5, ncol = 1)
+```
+
+### Cluster-specific marker genes
+```{r}
+markersAll_tumor <- FindAllMarkers(seTumor, assay = "SCT", return.thresh = 0.01)
+markersAll_tumor %>% group_by(cluster) %>% top_n(n = 4, wt = avg_log2FC)
+```
+
+#### Heatmap
+```{r, fig.height=14, fig.width=7}
+top20 <- markersAll_tumor %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+DoHeatmap(seTumor, features = top20$gene, group.bar.height = 0.005, slot = "scale.data") + plot_annotation("Heatmap of differentially expressed genes between clusters")
+```
+
+## DE comparison between tumour healthy versus tumour control
+
+In this segment, we selected and merged cancer regions and performed DEA. For the modalities of cancer + control and cancer only, the clusters will be merged into cancer regions and cancer-devoid regions based on the previous marker genes. The DE of both modalities will be compared. 
+
+### DE in Cancer-only sample 
+```{r}
+# Merging cancer clusters (by renaming)
+seTumor_merged <- seTumor
+new.cluster.ids <- c("healthy1", "tumor1", "tumor2", "tumor3", "tumor4", "adipose")
+names(new.cluster.ids) <- levels(seTumor_merged)
+seTumor_merged <- RenameIdents(seTumor, new.cluster.ids)
+tumor.vs.tumor.markers <- FindMarkers(seTumor_merged, ident.1 = c("tumor1", "tumor2", "tumor3", "tumor4"), ident.2 = "healthy1", assay = "SCT")
+```
+#### Top marker genes
+```{r, fig.height=7, fig.width=7}
+top20_ci <- tumor.vs.tumor.markers %>% top_n(n = 20, wt = avg_log2FC)
+DoHeatmap(seTumor_merged, features = rownames(top20_ci), group.bar.height = 0.005, slot = "scale.data") + plot_annotation("Grouped Tumor vs Healthy area (tumor-only)")
+```
+
+### DE including Control sample 
+```{r}
+# Merging cancer and healthy clusters (by renaming)
+merged_merged <- mergedPCA
+new.cluster.ids <- c("healthy1", "tumor1", "healthy2", "tumor2", "adipose")
+names(new.cluster.ids) <- levels(merged_merged)
+merged_merged <- RenameIdents(merged_merged, new.cluster.ids)
+levels(merged_merged) <- c("healthy1", "healthy2", "tumor1", "tumor2", "adipose")
+#tumor.vs.control.markers <- FindMarkers(merged_merged, ident.1 = "tumor", ident.2 = "healthy")
+tumor.vs.control.markers <- FindMarkers(merged_merged, ident.1 = c("tumor1","tumor2"), ident.2 = c("healthy1","healthy2"))
+```
+#### Top marker genes
+```{r, fig.height=7, fig.width=7}
+top20_cd <- tumor.vs.control.markers %>% top_n(n = 20, wt = avg_log2FC)
+DoHeatmap(merged_merged, features = rownames(top20_cd), group.bar.height = 0.005, slot = "scale.data") + plot_annotation("Grouped Tumor vs Healthy area (control-integrated dataset)")
+```
+
+
+#### Venn diagram ALL
+```{r, fig.width=7, fig.height=7}
+cd <- c(rownames(tumor.vs.control.markers))
+ci <- c(rownames(tumor.vs.tumor.markers))
+x <- list(cd,ci)
+
+
+#venn.diagram(list(cd,ci), filename= "vennTest", category.names = c("Control-dependent" , "Control-Independent"), output=TRUE, disable.logging = TRUE)
+
+v <- venn.diagram(x, filename= NULL, category.names = c("With Control" , "Tumour only"), disable.logging = TRUE, fill=c("blue","red"))
+
+# have a look at the default plot
+grid.newpage()
+grid.draw(v)
+
+# have a look at the names in the plot object v
+lapply(v,  names)
+# We are interested in the labels
+lapply(v, function(i) i$label)
+
+# Over-write labels (5 to 7 chosen by manual check of labels)
+# in foo only
+v[[5]]$label  <- paste(setdiff(cd, ci), collapse="\n")  
+# in baa only
+v[[6]]$label <- paste(setdiff(ci, cd)  , collapse="\n")  
+# intesection
+v[[7]]$label <- paste(intersect(cd, ci), collapse="\n")  
+
+# plot  
+#grid.newpage()
+#grid.draw(v)
+
+```
+
+
+#### Venn diagram top 20
+```{r, fig.width=7, fig.height=7}
+cd2 <- c(rownames(top20_cd))
+ci2 <- c(rownames(top20_ci))
+x <- list(cd,ci)
+
+
+#venn.diagram(list(cd,ci), filename= "vennTest", category.names = c("Control-dependent" , "Control-Independent"), output=TRUE, disable.logging = TRUE)
+
+v <- venn.diagram(x, filename= NULL, category.names = c("With Control" , "Tumour only"), disable.logging = TRUE, fill=c("blue","red"))
+
+# have a look at the default plot
+grid.newpage()
+grid.draw(v)
+
+# have a look at the names in the plot object v
+lapply(v,  names)
+# We are interested in the labels
+lapply(v, function(i) i$label)
+
+# Over-write labels (5 to 7 chosen by manual check of labels)
+# in foo only
+v[[5]]$label  <- paste(setdiff(cd2, ci2), collapse="\n")  
+# in baa only
+v[[6]]$label <- paste(setdiff(ci2, cd2), collapse="\n")  
+# intesection
+v[[7]]$label <- paste(intersect(cd2, ci2), collapse="\n")  
+
+# plot  
+grid.newpage()
+grid.draw(v)
+```
