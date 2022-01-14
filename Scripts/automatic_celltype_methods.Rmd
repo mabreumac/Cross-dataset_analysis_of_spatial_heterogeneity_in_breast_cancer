@@ -1,0 +1,68 @@
+---
+title: "automatic_celltype_methods"
+author: "Marcos Machado"
+date: "12/24/2021"
+output: html_document
+---
+
+### Not working cell type identification methods 
+#### Cell type identification using scCATCH
+(this is not working properly. There are a lot of bugs in the CellMatch database that do not let me simultaneously use the cancer option and also identify healthy tissue)
+
+
+Tissue and cancer types acording to the CellMatch database. Make sure to only include up-regulated genes
+```{r}
+# include only positively regulated gene set (very important)
+markersAll_upregulated <- FindAllMarkers(mergedPCA, assay = "SCT", return.thresh = 0.01, only.pos = TRUE)
+# markers_scCATCH <- findmarkergenes(mergedPCA, species = 'Human', cluster = 'All', match_CellMatch = TRUE, tissue = c("Breast", "Mammary epithelium", "White adipose tissue"), pvalue = 0.05)
+
+clu_ann <- scCATCH(object = markersAll_upregulated,
+                   species = 'Human',
+                   tissue = c("Breast")
+                   # cancer = c("Breast Cancer")
+                   )
+```
+
+
+#### Cell type identification using CellAssign
+(not working because of problems loadng Tensorflow :( )
+
+This is a cluster-independent method to assign cell types based on the gene expression matrix
+
+##### Data preparation
+Reading CellMarker database file with all cell types and marker genes, and generating a gene-by-celltype binary matrix. Also, we perform a conversion of our Seurat object to a SingleCellExperiment (SCE) object, which is now compatible with CellAssign
+```{r}
+# loading database file to data.frame
+CellMarkersDF <- read.csv("/home/marcos/Downloads/Single_cell_markers.txt", sep = "\t")
+CellMarkersDF <- CellMarkersDF[CellMarkersDF$speciesType == "Human",] # Remove mouse rows
+CellMarkersDF$cellName <- paste(CellMarkersDF$cellName, "_", CellMarkersDF$tissueType, "_", CellMarkersDF$cellType, "_", CellMarkersDF$PMID)
+
+# extracting celltypes and markers to binary matrix
+
+CellMarkers <- list(CellMarkersDF$cellName)
+CellMarkers[CellMarkersDF$cellName] = strsplit(as.character(CellMarkersDF$cellMarker), ", ")
+CellMarkers <- CellMarkers[-1]
+CellMarkers <- marker_list_to_mat(CellMarkers)
+
+
+# SCE conversion
+mergedPCA.sce <- as.SingleCellExperiment(mergedPCA, assay = "RNA")
+
+# mergedPCA.sce <- SingleCellExperiment(assays = list(counts = GetAssayData(object = mergedPCA, slot = "data")))
+```
+
+##### Run CellAssign
+
+```{r}
+# Intersection between gene-by-cellType matrix and sce genes
+shared <- intersect(rownames(CellMarkers), rownames(mergedPCA.sce))
+mergedPCA.sce <- computePooledFactors(mergedPCA.sce, assay.type = "counts")
+s <- sizeFactors(mergedPCA.sce)
+
+fit <- cellassign(exprs_obj = mergedPCA.sce[shared, ], 
+                  marker_gene_info = CellMarkers[shared, ], 
+                  learning_rate = 1e-2, 
+                  s = s,
+                  shrinkage = TRUE,
+                  verbose = FALSE)
+```
